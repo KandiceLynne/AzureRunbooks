@@ -78,7 +78,7 @@
         Write-Output "Off Session Hosts $offSessionHostsCount"
         Write-Output ($offSessionHost | Out-String)
        
-        if ($offSessionHosts.Count -eq 0 ) 
+        if ($offSessionHostsCount -eq 0 ) 
         {   
             Write-Error $ErrorMessage "Start threshold met, but the status variable is still not finding an available host to start"
         }
