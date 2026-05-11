@@ -1,3 +1,7 @@
+# You will need the AVD PoSH Modules installed to run this script
+# Install-Module Az -Scope CurrentUser
+# Install-Module Az.DesktopVirtualization -Scope CurrentUser
+
 # Login to Azure
 Connect-AzAccount
 
