@@ -1,144 +1,124 @@
-# -------------------------------------------------------------------
-# AVD Software Inventory Script
-# Runs in Azure Cloud Shell PowerShell
-#
-# Requirements:
-# - Az.Accounts
-# - Az.Compute
-# - Az.DesktopVirtualization
-#
-# Output:
-# - CSV containing installed software from all AVD session hosts
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# SOFTWARE INVENTORY - RESOURCE GROUP ONLY
+# ------------------------------------------------------------
 
-# =========================
 # VARIABLES
-# =========================
-
 $TenantId       = "<TENANT-ID>"
 $SubscriptionId = "<SUBSCRIPTION-ID>"
+$ResourceGroup  = "rg-avd-prod"
 
-# Host Pool Information
-$ResourceGroupName = "rg-avd-prod"
-$HostPoolName      = "hp-prod"
+# Output
+$OutputFile = "C:\Temp\AVD_Software_Inventory.csv"
 
-# Output file
-$OutputFile = "$HOME/avd_software_inventory.csv"
-
-# =========================
-# LOGIN / CONTEXT
-# =========================
-
+# Connect
 Connect-AzAccount -Tenant $TenantId
 
 Set-AzContext `
     -Tenant $TenantId `
     -SubscriptionId $SubscriptionId
 
-# =========================
-# GET SESSION HOSTS
-# =========================
-
-Write-Host "Getting AVD session hosts..." -ForegroundColor Cyan
-
-$SessionHosts = Get-AzWvdSessionHost `
-    -ResourceGroupName $ResourceGroupName `
-    -HostPoolName $HostPoolName
-
-if (!$SessionHosts)
-{
-    Write-Host "No session hosts found." -ForegroundColor Yellow
-    return
+# ONLY RUNNING VMs
+$VMs = Get-AzVM `
+    -ResourceGroupName $ResourceGroup `
+    -Status |
+Where-Object {
+    $_.PowerState -eq "VM running"
 }
 
-# =========================
-# RESULTS ARRAY
-# =========================
+Write-Host "Found $($VMs.Count) running VMs"
 
+# Results
 $Results = @()
 
-# =========================
-# LOOP THROUGH SESSION HOSTS
-# =========================
-
-foreach ($SessionHost in $SessionHosts)
+foreach ($VM in $VMs)
 {
-    # Extract VM name from session host name
-    # Example:
-    # hp-prod/avd-01.domain.local
-    # becomes:
-    # avd-01
-
-    $FullName = ($SessionHost.Name -split "/")[1]
-    $VMName   = ($FullName -split "\.")[0]
-
     Write-Host ""
-    Write-Host "Processing VM: $VMName" -ForegroundColor Green
+    Write-Host "Processing $($VM.Name)..." -ForegroundColor Cyan
 
     try
     {
-        # =========================================================
-        # RUN COMMAND ON VM
-        # =========================================================
+        # ----------------------------------------------------
+        # REMOTE SCRIPT
+        # ----------------------------------------------------
 
-        $Command = @'
-$Paths = @(
-    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
-    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-)
-
-$Software = foreach ($Path in $Paths)
-{
-    Get-ItemProperty $Path -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.DisplayName -and $_.DisplayName.Trim() -ne ""
-    } |
-    Select-Object `
-        DisplayName,
-        DisplayVersion,
-        Publisher,
-        InstallDate
+        $Script = @'
+$Apps = Get-ItemProperty `
+HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,
+HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* `
+-ErrorAction SilentlyContinue |
+Where-Object {
+    $_.DisplayName
 }
 
-$Software | Sort-Object DisplayName | ConvertTo-Json -Depth 3
+foreach ($App in $Apps)
+{
+    Write-Output "$($App.DisplayName)||$($App.DisplayVersion)||$($App.Publisher)||$($App.InstallDate)"
+}
 '@
 
-        $RunCommand = Invoke-AzVMRunCommand `
-            -ResourceGroupName $ResourceGroupName `
-            -VMName $VMName `
+        # ----------------------------------------------------
+        # RUN COMMAND
+        # ----------------------------------------------------
+
+        $Job = Invoke-AzVMRunCommand `
+            -ResourceGroupName $ResourceGroup `
+            -VMName $VM.Name `
             -CommandId 'RunPowerShellScript' `
-            -ScriptString $Command `
+            -ScriptString $Script `
             -ErrorAction Stop
 
-        # =========================================================
-        # PARSE RESULTS
-        # =========================================================
+        # ----------------------------------------------------
+        # VALIDATE OUTPUT
+        # ----------------------------------------------------
 
-        $JsonResult = $RunCommand.Value[0].Message
-
-        if ($JsonResult)
+        if ($null -eq $Job.Value)
         {
-            $SoftwareList = $JsonResult | ConvertFrom-Json
+            Write-Host "No output returned from $($VM.Name)" -ForegroundColor Yellow
+            continue
+        }
 
-            foreach ($App in $SoftwareList)
-            {
-                $Results += [PSCustomObject]@{
-                    VMName         = $VMName
-                    DisplayName    = $App.DisplayName
-                    DisplayVersion = $App.DisplayVersion
-                    Publisher      = $App.Publisher
-                    InstallDate    = $App.InstallDate
-                }
+        # ----------------------------------------------------
+        # GET RAW MESSAGE
+        # ----------------------------------------------------
+
+        $Output = $Job.Value.Message
+
+        # DEBUG
+        Write-Host "RAW OUTPUT:"
+        Write-Host $Output
+
+        # ----------------------------------------------------
+        # PARSE SOFTWARE LINES
+        # ----------------------------------------------------
+
+        $Lines = $Output -split "`r?`n"
+
+        $SoftwareLines = $Lines | Where-Object {
+            $_ -match '\|\|'
+        }
+
+        foreach ($Line in $SoftwareLines)
+        {
+            $Parts = $Line -split '\|\|',4
+
+            $Results += [PSCustomObject]@{
+                VMName         = $VM.Name
+                DisplayName    = $Parts[0]
+                DisplayVersion = $Parts[1]
+                Publisher      = $Parts[2]
+                InstallDate    = $Parts[3]
             }
         }
+
+        Write-Host "Collected $($SoftwareLines.Count) entries from $($VM.Name)" -ForegroundColor Green
     }
     catch
     {
-        Write-Host "Failed: $VMName" -ForegroundColor Red
+        Write-Host "Failed: $($VM.Name)" -ForegroundColor Red
         Write-Host $_.Exception.Message
 
         $Results += [PSCustomObject]@{
-            VMName         = $VMName
+            VMName         = $VM.Name
             DisplayName    = "ERROR"
             DisplayVersion = ""
             Publisher      = $_.Exception.Message
@@ -147,20 +127,16 @@ $Software | Sort-Object DisplayName | ConvertTo-Json -Depth 3
     }
 }
 
-# =========================
-# EXPORT RESULTS
-# =========================
-
-Write-Host ""
-Write-Host "Exporting results..." -ForegroundColor Cyan
+# ------------------------------------------------------------
+# EXPORT
+# ------------------------------------------------------------
 
 $Results |
-Sort-Object VMName, DisplayName |
 Export-Csv `
     -Path $OutputFile `
     -NoTypeInformation `
     -Encoding UTF8
 
 Write-Host ""
-Write-Host "Completed." -ForegroundColor Green
-Write-Host "Output File: $OutputFile" -ForegroundColor Yellow
+Write-Host "Completed"
+Write-Host "Output File: $OutputFile"
